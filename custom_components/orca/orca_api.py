@@ -50,7 +50,7 @@ CIRCUIT_NAME_MAP_SI = {
     "1. Floor": "1. nadstropje",
     "2. Floor": "2. nadstropje",
     "Attic": "mansarda",
-    "Radiator": "tadiatorji",
+    "Radiator": "radiatorji",
     "Convector": "konvektorji",
     "Heating": "gretje",
     "Cooling": "hlajenje",
@@ -184,7 +184,7 @@ class OrcaApi:
         circuit_tags = {
             0: ["2_Poti1"],
             1: ["2_Temp_Prostora"],
-            2: ["2_Temp_RF2"],
+            2: ["2_Vklop_C2", "2_Zahtevana_RF_MK_2", "2_Delovanje_MP2"],
             3: ["2_Poti5"],
             4: ["2_Poti3", "2_Poti3"],
             5: ["2_Temp_Zalog"],
@@ -198,9 +198,17 @@ class OrcaApi:
         results_map = {v.tag: v for v in results}
 
         for circuit_id, tags in circuit_tags.items():
-            # means all tags are in results and have valid value - the circuit is available
-            if len([t for t in tags if t in results_map]) == len(tags):
-                self.available_circuits.append(circuit_id)
+            present_count = len([t for t in tags if t in results_map])
+
+            # HC2 / radiatorji: dovolj je, da obstaja vsaj en veljaven tag
+            # ker nekateri senzorji na tej veji vračajo -9999, čeprav veja obstaja
+            if circuit_id == 2:
+                if present_count >= 1:
+                    self.available_circuits.append(circuit_id)
+            else:
+                # ostali krogi obdržijo staro logiko
+                if present_count == len(tags):
+                    self.available_circuits.append(circuit_id)
 
         final_config = []
 
