@@ -1,191 +1,426 @@
-"""Climate platform for Orca integration."""
+"""Orca Heat Pump API client."""
 
-from __future__ import annotations
+import asyncio
+import logging
+from pathlib import Path
+import re
+from typing import Any, Union
 
-from typing import Any
+import aiofiles
+import aiohttp
+from pydantic import BaseModel, TypeAdapter
+import yaml
 
-from homeassistant.components.climate import (
-    ClimateEntity,
-    ClimateEntityFeature,
-    HVACAction,
-    HVACMode,
+from .models import (
+    BooleanSensor,
+    FloatSensor,
+    LocalizedName,
+    MultimodeSensor,
+    OrcaTagConfig,
 )
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfTemperature
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import CONF_LANGUAGE, DOMAIN, LANG_EN, LANG_SI, LOGGER
-from .coordinator import OrcaDataUpdateCoordinator
-from .entity import OrcaEntity
-from .orca_api import CIRCUIT_NAME_MAP_SI
+_LOGGER = logging.getLogger(__name__)
 
-# Mapping of Orca modes to HA modes
-MODE_MAPPING = {
-    "auto": HVACMode.HEAT_COOL,
-    "cool": HVACMode.COOL,
-    "heat": HVACMode.HEAT,
+
+class OrcaTagValue(BaseModel):
+    """Represents a runtime value retrieved from the Heat Pump.
+
+    Replaces the previous dataclass.
+    """
+
+    tag: str
+    value: Union[float, int, bool, str, None]
+    config: OrcaTagConfig
+
+    def __repr__(self):
+        return f"Tag: {self.tag} | Value: {self.value} | ID: {self.config.id}"
+
+
+# translates english circuit names to slovenian
+CIRCUIT_NAME_MAP_SI = {
+    "Heating Circuit 1": "ogrevalni krog 1",
+    "Heating Circuit 2": "ogrevalni krog 2",
+    "Heating Circuit 3": "ogrevalni krog 1",
+    "Direct Circuit 1": "direktna veja 1",
+    "Direct Circuit 2": "direktna veja 2",
+    "Direct Circuit 3": "direktna veja 3",
+    "Cellar": "klet",
+    "Ground Floor": "pritličje",
+    "Floor": "talno",
+    "1. Floor": "1. nadstropje",
+    "2. Floor": "2. nadstropje",
+    "Attic": "mansarda",
+    "Radiator": "radiatorji",
+    "Convector": "konvektorji",
+    "Heating": "gretje",
+    "Cooling": "hlajenje",
+    "Wall": "stensko",
 }
 
-REVERSE_MODE_MAPPING = {
-    HVACMode.HEAT_COOL: "auto",
-    HVACMode.COOL: "cool",
-    HVACMode.HEAT: "heat",
-    HVACMode.OFF: "off",  # cannot be directly used
-}
 
-ACTION_MAPPING = {
-    "idle": HVACAction.IDLE,
-    "heating": HVACAction.HEATING,
-    "cooling": HVACAction.COOLING,
-    "defrost": HVACAction.HEATING,  # Treat defrost as heating for consistency
-}
+class OrcaApi:
+    """Client for interacting with the Orca Heat Pump API."""
 
+    def __init__(self, username, password, host, config_path=None) -> None:
+        """Initialize the Orca API client."""
+        self.username = username
+        self.password = password
+        self.host = host
+        self.available_circuits: list[int] = []
+        self._token = None
 
-async def async_setup_entry(
-    hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
-) -> None:
-    """Set up the Orca climate platform."""
-    coordinator: OrcaDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
+        # _config holds the validated Pydantic models
+        self._config: list[OrcaTagConfig] = []
+        self._config_by_tags: dict[str, OrcaTagConfig] = {}
+        self._config_by_ids: dict[str, OrcaTagConfig] = {}
 
-    # iterates thru integers representing available circuits, create separate climate entities for each circuit
-    # circuts 1 and 2 are used for room heating, usually floor and/or radiators
-    entities = [
-        OrcaClimate(coordinator, circuit_id)
-        for circuit_id in coordinator.api.available_circuits
-        if circuit_id in [1, 2]
-    ]
-    async_add_entities(entities)
-
-
-class OrcaClimate(OrcaEntity, ClimateEntity):
-    """Representation of an Orca Climate Device."""
-
-    _attr_temperature_unit = UnitOfTemperature.CELSIUS
-    _attr_hvac_modes = [HVACMode.OFF, HVACMode.HEAT, HVACMode.COOL, HVACMode.HEAT_COOL]
-    _attr_target_temperature_step = 0.1
-
-    def __init__(self, coordinator: OrcaDataUpdateCoordinator, circuit_id: int) -> None:
-        """Initialize the climate entity."""
-        self._circuit_id = circuit_id
-        super().__init__(coordinator, self._get_unique_id("hc_room_temp"))
-
-        # support for both languages
-        eng_name: str = self.coordinator.data.get(self._get_unique_id("hc_name")).value
-        if coordinator.config_entry.data.get(CONF_LANGUAGE, LANG_EN) == LANG_SI:
-            self._attr_name = str(CIRCUIT_NAME_MAP_SI[eng_name]).title()
+        # Resolve config path
+        if config_path:
+            self._config_path = config_path
         else:
-            self._attr_name = eng_name
-        self._attr_unique_id = (
-            f"{coordinator.config_entry.entry_id}_climate_{eng_name.lower()}"
-        )
+            current_dir = Path(__file__).parent
+            self._config_path = current_dir / "config.yml"
 
-        self._attr_supported_features = (
-            ClimateEntityFeature.TARGET_TEMPERATURE
-            | ClimateEntityFeature.TARGET_TEMPERATURE_RANGE
-        )
+    async def initialize(self):
+        """Load configuration and authenticate.
 
-    @property
-    def current_temperature(self) -> float | None:
-        """Return the current temperature."""
-        return self._get_value("hc_room_temp")
+        Loads config, authenticates, determines circuit names,
+        and updates tag definitions accordingly.
+        """
+        # Load raw configuration and convert to OrcaTagConfig models
+        initial_config = await self._load_config()
 
-    @property
-    def target_temperature(self) -> float | None:
-        """Return the temperature we try to reach."""
-        if not self._single_temp_in_use():
-            return None
-        return self._get_value("hc_desired_day_temp")
+        # Temporary map for circuit detection logic
+        self._config_by_tags = {s.tag: s for s in initial_config}
 
-    @property
-    def target_temperature_high(self) -> float | None:
-        """Return the highbound target temperature."""
-        if self._single_temp_in_use():
-            return None
-        return self._get_value("hc_desired_day_temp")
+        # Authenticate and determine valid circuits
+        self._config = await self._filter_and_rename_circuits(initial_config)
 
-    @property
-    def target_temperature_low(self) -> float | None:
-        """Return the lowbound target temperature."""
-        if self._single_temp_in_use():
-            return None
-        return self._get_value("hc_desired_night_temp")
+        # Rebuild lookups with final filtered/renamed config
+        self._config_by_tags = {s.tag: s for s in self._config}
+        self._config_by_ids = {s.unique_id: s for s in self._config}
 
-    @property
-    def hvac_mode(self) -> HVACMode | None:
-        """Return hvac operation ie. heat, cool mode."""
-        is_on = self._get_value("hc_turned_on")
-        if not is_on:
-            return HVACMode.OFF
+    async def fetch_all(self) -> list[OrcaTagValue]:
+        """Fetches all tags defined in config.
 
-        mode_val = self._get_value("hc_mode")
-        return MODE_MAPPING.get(mode_val, HVACMode.HEAT_COOL)
+        Returns a dict keyed by tag name containing OrcaTagValue objects.
+        Filters out invalid (-9999) or unknown tags.
+        """
+        return await self._get_bulk_values(tags=list(self._config_by_tags.keys()))
 
-    @property
-    def hvac_action(self) -> HVACAction | None:
-        """Return the current running hvac operation if supported."""
-        valve_status = self._get_value("valve_pos", convert_to_unique=False)
-        pump_running = self._get_value("hc_pump_status")  # on circuit level
+    async def fetch_by_tags(self, tags: list[str]) -> dict[str, OrcaTagValue]:
+        """Fetches specific list of tags."""
+        values = await self._get_bulk_values(tags)
+        return {v.tag: v for v in values}
 
-        # "room_heating" indicates heating circuit active (and not hot water)
-        if valve_status == "room_heating" and pump_running:
-            hp_status = self._get_value("current_state", convert_to_unique=False)
-            return ACTION_MAPPING.get(hp_status, HVACAction.IDLE)
-        return HVACAction.IDLE
+    async def fetch_by_ids(self, ids: list[str]) -> dict[str, OrcaTagValue]:
+        """Fetches specific list by unique ID."""
+        tags = [
+            self._config_by_ids[_id].tag for _id in ids if _id in self._config_by_ids
+        ]
+        values = await self._get_bulk_values(tags)
+        return {v.config.id: v for v in values}
 
-    def _get_value(self, id_: str, convert_to_unique: bool = True) -> Any:
-        """Safe getter for mapped keys."""
-        if convert_to_unique:
-            id_ = self._get_unique_id(id_)
-        if id_ in self.coordinator.data:
-            return self.coordinator.data[id_].value
+    async def set_value_by_tag(self, tag: str, value: Any):
+        """Sets a value on the heat pump by tag.
+
+        Performs necessary type conversions (e.g. float 22.5 -> int 225).
+        """
+        if tag not in self._config_by_tags:
+            raise ValueError(f"Tag {tag} is not defined in configuration.")
+
+        config = self._config_by_tags[tag]
+        if not config.adjustable.enabled:
+            raise ValueError(f"Tag {tag} is not marked as adjustable.")
+
+        converted_val = self._prepare_value_for_write(value, config)
+
+        url = f"http://{self.host}/cgi/writeTags?n=1&t1={tag}&v1={converted_val}"
+        await self._make_request(url)
+
+    async def set_value_by_id(self, id: str, value: Any):
+        config = self._config_by_ids.get(id)
+        if not config:
+            raise ValueError(f"Tag with ID {id} is not defined in configuration.")
+        return await self.set_value_by_tag(tag=config.tag, value=value)
+
+    async def _load_config(self) -> list[OrcaTagConfig]:
+        """Reads YAML and converts to Pydantic models."""
+        if not Path.exists(self._config_path):
+            raise FileNotFoundError(f"Config file not found at {self._config_path}")
+
+        async with aiofiles.open(self._config_path, encoding="utf8") as f:
+            content = await f.read()
+            yaml_data = yaml.safe_load(content) or {}
+
+        adapter = TypeAdapter(list[OrcaTagConfig])
+        return adapter.validate_python(yaml_data)
+
+    async def _filter_and_rename_circuits(
+        self, config_entries: list[OrcaTagConfig]
+    ) -> list[OrcaTagConfig]:
+        """Post-initialization to set final names and unique ID.
+
+        Determines which heating circuits are used by heat pump by checking
+        whether all tags in "circuit_tags" return a valid value.
+        Furthermore, circuits defined in "name_tags" are used to generate dynamic
+        name according to name set in heat pump (TALNO, FLOOR, RADIATOR...)
+
+        Returns only circuits that are actually configured.
+        """
+
+        # Tags that define the name of heating circuit
+        # likely result: {1: "MK1_IME", 2: "MK1_IME(2)"}
+        name_tags_map = {
+            s.heating_circuit: tag
+            for tag, s in self._config_by_tags.items()
+            if s.id == "hc_name"
+        }
+
+        # The following defines which fields must be available (return non-9999 value)
+        # to treat the heating circle as in use.
+        # If all tags don't return a valid value, all config.yml entries belonging
+        # to this circuit will not be fetched.
+        circuit_tags = {
+            0: ["2_Poti1"],
+            1: ["2_Temp_Prostora"],
+            2: ["2_Vklop_C2", "2_Zahtevana_RF_MK_2", "2_Delovanje_MP2"],
+            3: ["2_Poti5"],
+            4: ["2_Poti3", "2_Poti3"],
+            5: ["2_Temp_Zalog"],
+        }
+
+        tags_to_get = list(name_tags_map.values()) + [
+            t for tags in circuit_tags.values() for t in tags
+        ]
+
+        results = await self._get_bulk_values(tags=tags_to_get)
+        results_map = {v.tag: v for v in results}
+
+        for circuit_id, tags in circuit_tags.items():
+            present_count = len([t for t in tags if t in results_map])
+
+            # HC2 / radiatorji: dovolj je, da obstaja vsaj en veljaven tag
+            # ker nekateri senzorji na tej veji vračajo -9999, čeprav veja obstaja
+            if circuit_id == 2:
+                if present_count >= 1:
+                    self.available_circuits.append(circuit_id)
+            else:
+                # ostali krogi obdržijo staro logiko
+                if present_count == len(tags):
+                    self.available_circuits.append(circuit_id)
+
+        final_config = []
+
+        for config in config_entries:
+            if config.heating_circuit not in self.available_circuits:
+                continue
+
+            unique_id = config.id
+            new_name_en = config.name.en.capitalize()
+            new_name_si = config.name.si.capitalize()
+
+            # Logic for renaming based on circuit
+            if name_tag := name_tags_map.get(config.heating_circuit):
+                if name_result := results_map.get(name_tag):
+                    appendix_en = str(name_result.value)
+                    appendix_si = CIRCUIT_NAME_MAP_SI.get(
+                        appendix_en, str(config.heating_circuit)
+                    )
+                else:
+                    appendix_en = str(config.heating_circuit)
+                    appendix_si = str(config.heating_circuit)
+
+                new_name_en = f"{appendix_en} {config.name.en}".capitalize()
+                new_name_si = f"{appendix_si} {config.name.si}".capitalize()
+                unique_id = f"{config.id}_{config.heating_circuit}"
+
+            # update the config fields
+            updated_config = config.model_copy(
+                update={
+                    "unique_id": unique_id,
+                    "name": LocalizedName(en=new_name_en, si=new_name_si),
+                }
+            )
+
+            final_config.append(updated_config)
+
+        return final_config
+
+    async def _get_bulk_values(self, tags: list[str]) -> list[OrcaTagValue]:
+        """Internal method to fetch multiple tags."""
+        result = []
+        if not tags:
+            return result
+
+        parsed_data = {}
+        for uri in self._generate_uri(tags):
+            url = f"http://{self.host}{uri}"
+            response_text = await self._make_request(url)
+            parsed_data |= self._parse_response(response_text)
+
+        for tag, raw_val_str in parsed_data.items():
+            config = self._config_by_tags[tag]
+
+            # Check for non-existent sensors
+            if raw_val_str == "-9999":
+                continue
+
+            processed_value = self._convert_read_value(raw_val_str, config)
+
+            result.append(OrcaTagValue(tag=tag, value=processed_value, config=config))
+        return result
+
+    async def _make_request(self, url: str, attempt_auth=True) -> str:
+        """Handles HTTP request with auth retry logic."""
+        cookies = {"IDALToken": self._token} if self._token else {}
+
+        try:
+            async with aiohttp.ClientSession(cookies=cookies) as session:
+                async with session.get(url, timeout=10) as resp:
+                    data = await resp.text()
+        except aiohttp.ClientError as e:
+            raise ConnectionError(f"Failed to connect to heat pump: {e}")
+        except asyncio.TimeoutError:
+            raise TimeoutError("Request to heat pump timed out.")
+
+        if "#E_NEED_LOGIN" in data or "E_NEED_LOGIN" in data:
+            if attempt_auth:
+                _LOGGER.debug("Token expired or missing, authenticating again")
+                await self._authenticate()
+                return await self._make_request(url, attempt_auth=False)
+
+        if "#E_" in data and "E_UNKNOWNTAG" not in data:
+            raise RuntimeError(f"API Error: {data}")
+        return data
+
+    async def _authenticate(self):
+        """Authenticates with the Heat Pump."""
+        login_url = f"http://{self.host}/cgi/login?username={self.username}&password={self.password}"
+
+        while True:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(login_url, timeout=10) as resp:
+                        text = await resp.text()
+            except Exception as e:
+                raise ConnectionError(f"Auth connection failed: {e}")
+
+            if "IDALToken" in text:
+                match = re.search(r"IDALToken=([^\s]+)", text)
+                if match:
+                    self._token = match.group(1)
+                    _LOGGER.debug("Authentication successful")
+                    return
+                else:
+                    raise ValueError("Token not found in successful login response.")
+
+            elif "#E_TOO_MANY_USERS" in text:
+                _LOGGER.warning("Too many users. Retrying in 5s")
+                await asyncio.sleep(5)
+                continue
+            elif "#E_PASS_DONT_MATCH" in text:
+                raise PermissionError("Login failed: Incorrect credentials.")
+            else:
+                raise PermissionError(f"Login failed: {text}")
+
+    def _generate_uri(self, tags: list[str]) -> list[str]:
+        """Batches tags into URL parameters."""
+        params = ""
+        count = 0
+        uris = []
+        for tag in tags:
+            count += 1
+            params += f"&t{count}={tag}"
+            if count >= 150:
+                uris.append(f"/cgi/readTags?client=OrcaTouch1172&n={count}{params}")
+                params = ""
+                count = 0
+        if count > 0:
+            uris.append(f"/cgi/readTags?client=OrcaTouch1172&n={count}{params}")
+        return uris
+
+    def _parse_response(self, raw_data: str) -> dict[str, str]:
+        """Parses the raw hash/semicolon separated response."""
+        results = {}
+        entries = raw_data.strip().split("#")
+
+        for entry in entries:
+            clean_entry = entry.replace("\t", ";").replace("\n", ";")
+            parts = clean_entry.split(";")
+
+            if len(parts) < 4:
+                continue
+
+            tag_name = parts[0]
+            status = parts[1]
+            val = parts[3]
+
+            if status != "S_OK":
+                continue
+
+            results[tag_name] = val
+
+        return results
+
+    def _convert_read_value(self, raw_value: str, config: OrcaTagConfig) -> Any:
+        """Converts string from API to typed Python object."""
+
+        def safe_num(v):
+            try:
+                return int(v)
+            except ValueError:
+                try:
+                    return float(v)
+                except ValueError:
+                    return v
+
+        val = safe_num(raw_value)
+
+        if isinstance(config, FloatSensor):
+            if isinstance(val, int):
+                return round(val / 10.0, 1)
+            return 0.0
+
+        if isinstance(config, BooleanSensor):
+            return str(val) == "1"
+
+        if isinstance(config, MultimodeSensor):
+            if isinstance(val, int) and val in config.value_map:
+                return config.value_map[val]
+            return val
+
         return None
 
-    def _get_unique_id(self, id_: str) -> str:
-        """Get the unique ID for a given tag ID based on circuit ID."""
-        return f"{id_}_{self._circuit_id}"
+    def _prepare_value_for_write(self, input_value: Any, config: OrcaTagConfig) -> str:
+        """Prepares a Python value to be sent to the API."""
 
-    def _single_temp_in_use(self) -> bool:
-        """Check if we are in 24h regime. If yes, only single temp is used."""
-        if self._get_value("timer_programme") == "24h":
-            # means timer (časovni program) is not used
-            return True
-        return False
+        if isinstance(config, FloatSensor):
+            try:
+                float_val = float(input_value)
+            except ValueError:
+                raise ValueError(f"Invalid numeric value: {input_value}")
+            if (
+                float_val < config.adjustable.range.min
+                or float_val > config.adjustable.range.max
+            ):
+                raise ValueError(
+                    f"Value {float_val} out of range ({config.adjustable.range.min} - {config.adjustable.range.max})"
+                )
+            return str(int(float_val * 10))
 
-    async def async_set_temperature(self, **kwargs: Any) -> None:
-        """Set new target temperature."""
+        elif isinstance(config, BooleanSensor):
+            if isinstance(input_value, bool):
+                return "1" if input_value else "0"
+            raise ValueError("Provided value is not boolean")
 
-        if (temp_low := kwargs.get("target_temp_low")) is not None:
-            await self.coordinator.api.set_value_by_id(
-                self._get_unique_id("hc_desired_night_temp"), value=temp_low
+        elif isinstance(config, MultimodeSensor):
+            str_val = str(input_value)
+            reverse_map = {v: k for k, v in config.value_map.items()}
+            if str_val in reverse_map:
+                return str(reverse_map[str_val])
+            raise ValueError(
+                f"Invalid mode value: {str_val}. Valid options: {list(config.value_map.values())}"
             )
 
-        if (temp_high := kwargs.get("target_temp_high")) is not None:
-            await self.coordinator.api.set_value_by_id(
-                self._get_unique_id("hc_desired_day_temp"), value=temp_high
-            )
-
-        if (temp := kwargs.get("temperature")) is not None:
-            await self.coordinator.api.set_value_by_id(
-                self._get_unique_id("hc_desired_day_temp"), value=temp
-            )
-
-        await self.coordinator.async_request_refresh()
-
-    async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        """Set new target hvac mode."""
-        val = REVERSE_MODE_MAPPING.get(hvac_mode)
-        if val is None:
-            LOGGER.error("Unknown mode: %s", hvac_mode)
-            return
-
-        if val == "off":
-            await self.coordinator.api.set_value_by_id("hc_turned_on", False)
-        else:
-            # Ensure On, then set mode
-            await self.coordinator.api.set_value_by_id("hc_turned_on", True)
-            await self.coordinator.api.set_value_by_id("hc_mode", val)
-
-        await self.coordinator.async_request_refresh()
+        return str(input_value)
